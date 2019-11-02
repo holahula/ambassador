@@ -358,7 +358,7 @@ class Config:
         if not resource.get('namespace', None):
             resource['namespace'] = self.ambassador_namespace
 
-        # ...and off we go. Save the source info...
+        # ...it doesn't actually need a label_selected, so off we go. Save the source info...
         self.save_source(resource)
 
         # ...and figure out if this thing is OK.
@@ -511,6 +511,7 @@ class Config:
 
         name = rdict.pop('name', None)
         namespace = rdict.pop('namespace', None)
+        label_selected = rdict.pop('label_selected', None)
         generation = rdict.pop('generation', None)
 
         serialized = json.dumps(rdict)

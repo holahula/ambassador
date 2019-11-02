@@ -9,6 +9,7 @@
         "kind": { "type": "string" },
         "name": { "type": "string" },
         "namespace": { "type": "string" },
+        "label_selected": { "type": "string" },
         "ambassador_id": {
             "anyOf": [
                 { "type": "string" },

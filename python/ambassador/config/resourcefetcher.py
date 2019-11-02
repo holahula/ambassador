@@ -134,7 +134,8 @@ class ResourceFetcher:
             self.finalize()
 
     def parse_yaml(self, serialization: str, k8s=False, rkey: Optional[str]=None,
-                   filename: Optional[str]=None, finalize: bool=True, namespace: Optional[str]=None) -> None:
+                   filename: Optional[str]=None, finalize: bool=True, namespace: Optional[str]=None,
+                   label_selected: Optional[str]=None) -> None:
         # self.logger.debug("%s: parsing %d byte%s of YAML:\n%s" %
         #                   (self.location, len(serialization), "" if (len(serialization) == 1) else "s",
         #                    serialization))
@@ -145,7 +146,8 @@ class ResourceFetcher:
         try:
             # UGH. This parse_yaml is the one we imported from utils. XXX This needs to be fixed.
             objects = parse_yaml(serialization)
-            self.parse_object(objects=objects, k8s=k8s, rkey=rkey, filename=filename, namespace=namespace)
+            self.parse_object(objects=objects, k8s=k8s, rkey=rkey, filename=filename,
+                              namespace=namespace, label_selected=label_selected)
         except yaml.error.YAMLError as e:
             self.aconf.post_error("%s: could not parse YAML: %s" % (self.location, e))
 
@@ -192,25 +194,11 @@ class ResourceFetcher:
 
             # Handle normal Kube objects...
             for key in [ 'service', 'endpoints', 'secret', 'ingresses' ]:
-                objects_by_type = watt_k8s.get(key) or {}
-
-                for watch_id, objects in objects_by_type.items():
-                    self.logger.info(f"K8s raw {key}: looking at {watch_id}")
-
-                    for obj in objects or []:
-                        # self.logger.debug(f"Handling Kubernetes {key}...")
-                        self.handle_k8s(obj)
+                self.handle_watt_segment(watt_k8s, key)
 
             # ...then handle Ambassador CRDs.
             for key in CRDTypes:
-                objects_by_type = watt_k8s.get(key) or {}
-
-                for watch_id, objects in objects_by_type.items():
-                    self.logger.info(f"K8s CRD {key}: looking at {watch_id}")
-
-                    for obj in objects or []:
-                        # self.logger.debug(f"Handling CRD {key}...")
-                        self.handle_k8s_crd(obj)
+                self.handle_watt_segment(watt_k8s, key)
 
             watt_consul = watt_dict.get('Consul', {})
             consul_endpoints = watt_consul.get('Endpoints', {})
@@ -229,7 +217,26 @@ class ResourceFetcher:
         if finalize:
             self.finalize()
 
-    def handle_k8s(self, obj: dict) -> None:
+    def handle_watt_segment(self, watt_k8s, key: str) -> None:
+        objects_by_type = watt_k8s.get(key) or {}
+
+        for watch_id, objects in objects_by_type.items():
+            w_fields = watch_id.split('|')
+            w_kind = w_fields[0]
+            w_namespace = w_fields[1]
+            w_field_sel = None
+            w_label_sel = None
+
+            if len(w_fields) > 2:
+                w_field_sel, w_label_sel = w_fields[2:4]
+
+            self.logger.info(f"K8s {key}: looking at {w_label_sel or '-global-'}")
+
+            for obj in objects or []:
+                # self.logger.debug(f"Handling Kubernetes {key}...")
+                self.handle_k8s(obj, w_label_sel)
+
+    def handle_k8s(self, obj: dict, label_selected: Optional[str]) -> None:
         # self.logger.debug("handle_k8s obj %s" % json.dumps(obj, indent=4, sort_keys=True))
 
         kind = obj.get('kind')
@@ -254,14 +261,14 @@ class ResourceFetcher:
             self.logger.debug(f"{self.location}: skipping K8s {kind}")
             return
 
-        result = handler(obj)
+        result = handler(obj, label_selected)
 
         if result:
             rkey, parsed_objects = result
 
             self.parse_object(parsed_objects, k8s=False, filename=self.filename, rkey=rkey)
 
-    def handle_k8s_crd(self, obj: dict) -> None:
+    def handle_k8s_crd(self, obj: dict, label_selected: Optional[str]) -> None:
         # CRDs are _not_ allowed to have embedded objects in annotations, because ew.
         # self.logger.debug(f"Handling K8s CRD: {obj}")
 
@@ -313,11 +320,15 @@ class ResourceFetcher:
         amb_object['kind'] = kind
         amb_object['generation'] = generation
 
+        if label_selected:
+            amb_object['label_selected'] = label_selected
+
         # Done. Parse it.
         self.parse_object([ amb_object ], k8s=False, filename=self.filename, rkey=resource_identifier)
 
     def parse_object(self, objects, k8s=False, rkey: Optional[str]=None,
-                     filename: Optional[str]=None, namespace: Optional[str]=None):
+                     filename: Optional[str]=None, namespace: Optional[str]=None,
+                     label_selected: Optional[str]=None):
         self.push_location(filename, 1)
 
         # self.logger.debug("PARSE_OBJECT: incoming %d" % len(objects))
@@ -326,17 +337,18 @@ class ResourceFetcher:
             # self.logger.debug("PARSE_OBJECT: checking %s" % obj)
 
             if k8s:
-                self.handle_k8s(obj)
+                self.handle_k8s(obj, label_selected)
             else:
                 # if not obj:
                 #     self.logger.debug("%s: empty object from %s" % (self.location, serialization))
 
-                self.process_object(obj, rkey=rkey, namespace=namespace)
+                self.process_object(obj, rkey=rkey, namespace=namespace, label_selected=label_selected)
                 self.ocount += 1
 
         self.pop_location()
 
-    def process_object(self, obj: dict, rkey: Optional[str]=None, namespace: Optional[str]=None) -> None:
+    def process_object(self, obj: dict, rkey: Optional[str]=None, namespace: Optional[str]=None,
+                       label_selected: Optional[str]=None) -> None:
         if not isinstance(obj, dict):
             # Bug!!
             if not obj:
@@ -379,9 +391,12 @@ class ResourceFetcher:
 
         # self.logger.debug("%s PROCESS %s updated rkey to %s" % (self.location, obj['kind'], rkey))
 
-        # Force the namespace, if need be.
+        # Force the namespace and label_selected, if need be.
         if namespace and not obj.get('namespace', None):
             obj['namespace'] = namespace
+
+        if label_selected and not obj.get('label_selected', None):
+            obj['label_selected'] = label_selected
 
         # Brutal hackery.
         if obj['kind'] == 'Service':
@@ -402,7 +417,7 @@ class ResourceFetcher:
     def sorted(self, key=lambda x: x.rkey):  # returns an iterator, probably
         return sorted(self.elements, key=key)
 
-    def handle_k8s_ingress(self, k8s_object: AnyDict) -> HandlerResult:
+    def handle_k8s_ingress(self, k8s_object: AnyDict, label_selected: Optional[str]) -> HandlerResult:
         metadata = k8s_object.get('metadata', None)
         ingress_name = metadata.get('name') if metadata else None
         ingress_namespace = metadata.get('namespace', 'default') if metadata else None
@@ -482,7 +497,7 @@ class ResourceFetcher:
                     ingress_tls_context['spec']['hosts'] = tls_hosts
 
                 self.logger.info(f"Generated TLS Context from ingress {ingress_name}: {ingress_tls_context}")
-                self.handle_k8s_crd(ingress_tls_context)
+                self.handle_k8s_crd(ingress_tls_context, label_selected)
 
         # parse ingress.spec.backend
         default_backend = ingress_spec.get('backend', {})
@@ -506,7 +521,7 @@ class ResourceFetcher:
             }
 
             self.logger.info(f"Generated mapping from Ingress {ingress_name}: {default_backend_mapping}")
-            self.handle_k8s_crd(default_backend_mapping)
+            self.handle_k8s_crd(default_backend_mapping, label_selected)
 
         # parse ingress.spec.rules
         ingress_rules = ingress_spec.get('rules', [])
@@ -547,7 +562,7 @@ class ResourceFetcher:
                     path_mapping['spec']['host'] = rule_host
 
                 self.logger.info(f"Generated mapping from Ingress {ingress_name}: {path_mapping}")
-                self.handle_k8s_crd(path_mapping)
+                self.handle_k8s_crd(path_mapping, label_selected)
 
         # let's make arrangements to update Ingress' status now
         if not self.ambassador_service_raw:
@@ -588,7 +603,7 @@ class ResourceFetcher:
                 if pod_label.rstrip() == f'{key}="{value}"':
                     return True
 
-    def handle_k8s_endpoints(self, k8s_object: AnyDict) -> HandlerResult:
+    def handle_k8s_endpoints(self, k8s_object: AnyDict, label_selected: Optional[str]) -> HandlerResult:
         # Don't include Endpoints unless endpoint routing is enabled.
         if not Config.enable_endpoints:
             return None
@@ -704,12 +719,16 @@ class ResourceFetcher:
                     'addresses': addresses,
                     'ports': port_dict
                 }
+
+                if label_selected:
+                    self.k8s_endpoints[resource_identifier]['label_selected'] = label_selected
+
             else:
                 self.logger.debug(f"ignoring K8s Endpoints {resource_identifier} with no routable ports")
 
         return None
 
-    def handle_k8s_service(self, k8s_object: AnyDict) -> HandlerResult:
+    def handle_k8s_service(self, k8s_object: AnyDict, label_selected: Optional[str]) -> HandlerResult:
         # The annoying bit about K8s Service resources is that not only do we have to look
         # inside them for Ambassador resources, but we also have to save their info for
         # later endpoint resolution too.
@@ -767,6 +786,9 @@ class ResourceFetcher:
                 'ports': ports
             }
 
+            if label_selected:
+                self.k8s_services[resource_identifier]['label_selected'] = label_selected,
+
             selector = spec.get('selector', {})
 
             if self.is_ambassador_service(labels, selector):
@@ -790,7 +812,7 @@ class ResourceFetcher:
         return resource_identifier, objects
 
     # Handler for K8s Secret resources.
-    def handle_k8s_secret(self, k8s_object: AnyDict) -> HandlerResult:
+    def handle_k8s_secret(self, k8s_object: AnyDict, label_selected: Optional[str]) -> HandlerResult:
         # XXX Another one where we shouldn't be saving everything.
 
         secret_type = k8s_object.get('type', None)
@@ -851,6 +873,9 @@ class ResourceFetcher:
             'namespace': resource_namespace,
             'secret_type': secret_type
         }
+
+        if label_selected:
+            secret_info['label_selected'] = label_selected,
 
         for key, value in data.items():
             secret_info[key.replace('.', '_')] = value
@@ -940,6 +965,7 @@ class ResourceFetcher:
         for key, k8s_svc in self.k8s_services.items():
             k8s_name = k8s_svc['name']
             k8s_namespace = k8s_svc['namespace']
+            k8s_label_selected = k8s_svc.get('label_selected', None)
 
             target_ports = {}
             target_addrs = []
@@ -1076,7 +1102,7 @@ class ResourceFetcher:
                     'port': target_port
                 } for target_addr in target_addrs ]
 
-            self.services[f'k8s-{k8s_name}-{k8s_namespace}'] = {
+            svc_resource = {
                 'apiVersion': 'ambassador/v1',
                 'ambassador_id': Config.ambassador_id,
                 'kind': 'Service',
@@ -1084,6 +1110,11 @@ class ResourceFetcher:
                 'namespace': k8s_namespace,
                 'endpoints': svc_endpoints
             }
+
+            if k8s_label_selected:
+                svc_resource['label_selected'] = k8s_label_selected
+
+            self.services[f'k8s-{k8s_name}-{k8s_namespace}'] = svc_resource
 
         # OK. After all that, go turn all of the things in self.services into Ambassador
         # Service resources.
